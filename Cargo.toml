@@ -11,6 +11,7 @@ cortex-m-rt = "0.7"
 critical-section = "1"
 panic-halt = "*"
 nrf52832-hal = "*"
+rtic-monotonic = "1"
 
 # cargo build/run
 [profile.dev]
