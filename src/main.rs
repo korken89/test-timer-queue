@@ -1,7 +1,11 @@
+//! Crate
+
 #![no_std]
 #![no_main]
+#![deny(missing_docs)]
 
 use core::future::poll_fn;
+use core::marker::PhantomPinned;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use cortex_m_rt::entry;
@@ -60,6 +64,7 @@ pub trait Monotonic {
 
 // --------- Timer Queue --------
 
+/// Holds a waker and at which time instant this waker shall be awoken.
 pub struct WaitingWaker<Mono: Monotonic> {
     waker: Waker,
     release_at: Mono::Instant,
@@ -208,11 +213,13 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
 
 // -------- LinkedList ----------
 
+/// A sorted linked list for the timer queue.
 pub struct LinkedList<T> {
     head: AtomicPtr<Link<T>>,
 }
 
 impl<T> LinkedList<T> {
+    /// Create a new linked list.
     pub const fn new() -> Self {
         Self {
             head: AtomicPtr::new(core::ptr::null_mut()),
@@ -220,13 +227,9 @@ impl<T> LinkedList<T> {
     }
 }
 
-pub struct Link<T> {
-    val: T,
-    next: AtomicPtr<Link<T>>,
-}
-
 impl<T: PartialOrd + Clone> LinkedList<T> {
     #[inline(never)]
+    /// Peek at the first element in the queue.
     pub fn peek<R, F: FnOnce(Option<&T>) -> R>(&self, f: F) -> R {
         cs::with(|_| {
             // Make sure all previous writes are visible
@@ -240,6 +243,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
     }
 
     #[inline(never)]
+    /// Pop the first element in the queue.
     pub fn pop(&self) -> Option<T> {
         cs::with(|_| {
             // Make sure all previous writes are visible
@@ -264,6 +268,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
     }
 
     #[inline(never)]
+    /// Delete a link at an address.
     pub fn delete(&self, addr: usize) {
         cs::with(|_| {
             // Make sure all previous writes are visible
@@ -310,6 +315,8 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
     }
 
     #[inline(never)]
+    /// Insert a new link into the linked list.
+    /// The address of the link is return for use with `delete`.
     pub fn insert(&self, val: &mut Link<T>) -> usize {
         cs::with(|_| {
             let addr = val as *const _ as usize;
@@ -372,13 +379,20 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
     }
 }
 
-unsafe impl<T> Sync for LinkedList<T> {}
+/// A link in the linked list.
+pub struct Link<T> {
+    val: T,
+    next: AtomicPtr<Link<T>>,
+    _up: PhantomPinned,
+}
 
 impl<T> Link<T> {
+    /// Create a new link.
     pub const fn new(val: T) -> Self {
         Self {
             val,
             next: AtomicPtr::new(core::ptr::null_mut()),
+            _up: PhantomPinned,
         }
     }
 }
