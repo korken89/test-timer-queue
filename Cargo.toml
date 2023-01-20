@@ -12,6 +12,7 @@ critical-section = "1"
 panic-halt = "*"
 nrf52832-hal = "*"
 rtic-monotonic = "1"
+futures-util = { version = "0.3.25", default-features = false }
 
 # cargo build/run
 [profile.dev]

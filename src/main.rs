@@ -4,11 +4,15 @@
 #![no_main]
 #![deny(missing_docs)]
 
-use core::future::poll_fn;
+use core::future::{poll_fn, Future};
 use core::marker::PhantomPinned;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use cortex_m_rt::entry;
+use futures_util::{
+    future::{select, Either},
+    pin_mut,
+};
 use nrf52832_hal as _;
 use nrf52832_hal::pac::interrupt;
 use panic_halt as _;
@@ -96,6 +100,9 @@ pub struct TimerQueue<Mono: Monotonic> {
     queue: LinkedList<WaitingWaker<Mono>>,
 }
 
+/// .
+pub struct TimeoutError;
+
 impl<Mono: Monotonic> TimerQueue<Mono> {
     /// Make a new queue.
     pub const fn new() -> Self {
@@ -108,7 +115,7 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
     ///
     /// Safety: It's always safe to call, but it should only be called from the interrupt of the
     /// monotonic timer.
-    pub unsafe fn on_mono_interrupt(&self) {
+    pub unsafe fn on_monotonic_interrupt(&self) {
         let now = Mono::now();
 
         Mono::clear_compare_flag();
@@ -120,8 +127,8 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
                     .unwrap_or(None)
             });
 
-            if let Some(v) = head {
-                match v {
+            if let Some((should_pop, release_at)) = head {
+                match (should_pop, release_at) {
                     (false, instant) => {
                         Mono::enable_timer();
                         Mono::set_compare(instant);
@@ -145,6 +152,32 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
                 Mono::disable_timer();
             }
         }
+    }
+
+    /// Timeout at a specific time.
+    pub async fn timeout_at<F: Future>(
+        &self,
+        instant: Mono::Instant,
+        future: F,
+    ) -> Result<F::Output, TimeoutError> {
+        let delay = self.delay_until(instant);
+
+        pin_mut!(future);
+        pin_mut!(delay);
+
+        match select(future, delay).await {
+            Either::Left((r, _)) => Ok(r),
+            Either::Right(_) => Err(TimeoutError),
+        }
+    }
+
+    /// Timeout after a specific duration.
+    pub async fn timeout_after<F: Future>(
+        &self,
+        duration: Mono::Duration,
+        future: F,
+    ) -> Result<F::Output, TimeoutError> {
+        self.timeout_at(Mono::now() + duration, future).await
     }
 
     /// Delay for some duration of time.
