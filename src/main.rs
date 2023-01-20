@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use cortex_m_rt::entry;
 use nrf52832_hal as _;
@@ -20,12 +20,6 @@ use critical_section as cs;
 /// The trait enforces that proper time-math is implemented between `Instant` and `Duration`. This
 /// is a requirement on the time library that the user chooses to use.
 pub trait Monotonic {
-    /// This tells the timer queue if it should disable the interrupt bound to the monotonic if there are no
-    /// scheduled tasks. One may want to set this to `false` if one is using the `on_interrupt`
-    /// method to perform housekeeping and need overflow interrupts to happen, such as when
-    /// extending a 16 bit timer to 32/64 bits, even if there are no scheduled tasks.
-    const DISABLE_TIMER_ON_EMPTY_QUEUE: bool = false;
-
     /// The time at time zero.
     const ZERO: Self::Instant;
 
@@ -164,7 +158,11 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
             release_at: instant,
         });
 
-        // TODO: Add a dropper that deletes the node.
+        let marker = &AtomicUsize::new(0);
+
+        let dropper = OnDrop::new(|| {
+            queue.delete(marker.load(Ordering::Relaxed));
+        });
 
         poll_fn(|_| {
             if Mono::now() >= instant {
@@ -173,12 +171,38 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
 
             if first_run {
                 first_run = false;
-                queue.insert(&mut link);
+                marker.store(queue.insert(&mut link), Ordering::Relaxed);
             }
 
             Poll::Pending
         })
         .await;
+
+        // Make sure that our link is deleted from the list before we drop this stack
+        drop(dropper);
+    }
+}
+
+struct OnDrop<F: FnOnce()> {
+    f: core::mem::MaybeUninit<F>,
+}
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub fn new(f: F) -> Self {
+        Self {
+            f: core::mem::MaybeUninit::new(f),
+        }
+    }
+
+    #[allow(unused)]
+    pub fn defuse(self) {
+        core::mem::forget(self)
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        unsafe { self.f.as_ptr().read()() }
     }
 }
 
@@ -240,8 +264,56 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
     }
 
     #[inline(never)]
-    pub fn insert(&self, val: &mut Link<T>) {
+    pub fn delete(&self, addr: usize) {
         cs::with(|_| {
+            // Make sure all previous writes are visible
+            core::sync::atomic::fence(Ordering::SeqCst);
+
+            let head = self.head.load(Ordering::Relaxed);
+
+            // SAFETY: `as_ref` is safe as `insert` requires a valid reference to a link
+            let head_ref = if let Some(head_ref) = unsafe { head.as_ref() } {
+                head_ref
+            } else {
+                // 1. List is empty, do nothing
+                return;
+            };
+
+            if head as *const _ as usize == addr {
+                // 2. Replace head with head.next
+                self.head
+                    .store(head_ref.next.load(Ordering::Relaxed), Ordering::Relaxed);
+
+                return;
+            }
+
+            // 3. search list for correct node
+            let mut curr = head_ref;
+            let mut next = head_ref.next.load(Ordering::Relaxed);
+
+            // SAFETY: `as_ref` is safe as `insert` requires a valid reference to a link
+            while let Some(next_link) = unsafe { next.as_ref() } {
+                // Next is not null
+
+                if next as *const _ as usize == addr {
+                    curr.next
+                        .store(next_link.next.load(Ordering::Relaxed), Ordering::Relaxed);
+
+                    return;
+                }
+
+                // Continue searching
+                curr = next_link;
+                next = next_link.next.load(Ordering::Relaxed);
+            }
+        })
+    }
+
+    #[inline(never)]
+    pub fn insert(&self, val: &mut Link<T>) -> usize {
+        cs::with(|_| {
+            let addr = val as *const _ as usize;
+
             // Make sure all previous writes are visible
             core::sync::atomic::fence(Ordering::SeqCst);
 
@@ -255,7 +327,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
                 head_ref
             } else {
                 self.head.store(val, Ordering::Relaxed);
-                return;
+                return addr;
             };
 
             // 2. val needs to go in first
@@ -266,7 +338,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
                 // `val` is now first in the queue
                 self.head.store(val, Ordering::Relaxed);
 
-                return;
+                return addr;
             }
 
             // 3. search list for correct place
@@ -284,7 +356,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
                     // Insert `val`
                     curr.next.store(val, Ordering::Relaxed);
 
-                    return;
+                    return addr;
                 }
 
                 // Continue searching
@@ -294,7 +366,9 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
 
             // No next, write link to last position in list
             curr.next.store(val, Ordering::Relaxed);
-        });
+
+            addr
+        })
     }
 }
 
