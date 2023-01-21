@@ -3,12 +3,16 @@
 #![no_std]
 #![no_main]
 #![deny(missing_docs)]
+#![feature(async_fn_in_trait)]
 
+use core::cell::UnsafeCell;
 use core::future::{poll_fn, Future};
 use core::marker::PhantomPinned;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
+use cortex_m::peripheral::SYST;
 use cortex_m_rt::entry;
+use fugit::ExtU32;
 use futures_util::{
     future::{select, Either},
     pin_mut,
@@ -18,6 +22,105 @@ use nrf52832_hal::pac::interrupt;
 use panic_halt as _;
 
 use critical_section as cs;
+
+use embedded_hal_async::delay::DelayUs;
+
+// --------- SysTick example impl ---------
+
+/// Systick implementing `rtic_monotonic::Monotonic` which runs at a
+/// settable rate using the `TIMER_HZ` parameter.
+pub struct Systick<const TIMER_HZ: u32> {}
+
+impl<const TIMER_HZ: u32> Systick<TIMER_HZ> {
+    /// Provide a new `Monotonic` based on SysTick.
+    ///
+    /// The `sysclk` parameter is the speed at which SysTick runs at. This value should come from
+    /// the clock generation function of the used HAL.
+    ///
+    /// Notice that the actual rate of the timer is a best approximation based on the given
+    /// `sysclk` and `TIMER_HZ`.
+    pub fn new(mut systick: cortex_m::peripheral::SYST, sysclk: u32) -> Self {
+        // + TIMER_HZ / 2 provides round to nearest instead of round to 0.
+        // - 1 as the counter range is inclusive [0, reload]
+        let reload = (sysclk + TIMER_HZ / 2) / TIMER_HZ - 1;
+
+        assert!(reload <= 0x00ff_ffff);
+        assert!(reload > 0);
+
+        systick.disable_counter();
+        systick.set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
+        systick.set_reload(reload);
+        systick.enable_interrupt();
+        systick.enable_counter();
+
+        Systick {}
+    }
+
+    fn systick() -> SYST {
+        unsafe { core::mem::transmute::<(), SYST>(()) }
+    }
+}
+
+static SYSTICK_CNT: AtomicU32 = AtomicU32::new(0);
+
+impl<const TIMER_HZ: u32> Monotonic for Systick<TIMER_HZ> {
+    type Instant = fugit::TimerInstantU32<TIMER_HZ>;
+    type Duration = fugit::TimerDurationU32<TIMER_HZ>;
+
+    const ZERO: Self::Instant = Self::Instant::from_ticks(0);
+
+    fn now() -> Self::Instant {
+        Self::Instant::from_ticks(SYSTICK_CNT.load(Ordering::Relaxed))
+    }
+
+    fn set_compare(_: Self::Instant) {
+        // No need to do something here, we get interrupts anyway.
+    }
+
+    fn clear_compare_flag() {
+        // NOOP with SysTick interrupt
+    }
+
+    fn pend_interrupt() {
+        cortex_m::peripheral::SCB::set_pendst();
+    }
+
+    fn on_interrupt() {
+        if Self::systick().has_wrapped() {
+            SYSTICK_CNT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn enable_timer() {}
+
+    fn disable_timer() {}
+}
+
+impl<const TIMER_HZ: u32> DelayUs for TimerQueue<Systick<TIMER_HZ>> {
+    type Error = core::convert::Infallible;
+
+    async fn delay_us(&mut self, us: u32) -> Result<(), Self::Error> {
+        Ok(self.delay(us.micros()).await)
+    }
+
+    async fn delay_ms(&mut self, ms: u32) -> Result<(), Self::Error> {
+        Ok(self.delay(ms.millis()).await)
+    }
+}
+
+/// Register the Systick interrupt and crate a timer queue with a specific name.
+#[macro_export]
+macro_rules! make_systick_timer_queue {
+    ($timer_queue_name:ident, $systick:ident) => {
+        static $timer_queue_name: TimerQueue<$systick> = TimerQueue::new();
+
+        #[no_mangle]
+        #[allow(non_snake_case)]
+        unsafe extern "C" fn SysTick() {
+            $timer_queue_name.on_monotonic_interrupt();
+        }
+    };
+}
 
 // --------- Monotonic trait ---------
 
@@ -57,12 +160,16 @@ pub trait Monotonic {
     /// Clear the compare interrupt flag.
     fn clear_compare_flag();
 
-    /// Optional. This is used to save power, this is called when the Monotonic interrupt is
-    /// enabled.
+    /// Pend the timer's interrupt.
+    fn pend_interrupt();
+
+    /// Optional. Runs on interrupt before any timer queue handling.
+    fn on_interrupt() {}
+
+    /// Optional. This is used to save power, this is called when the timer queue is not empty.
     fn enable_timer() {}
 
-    /// Optional. This is used to save power, this is called when the Monotonic interrupt is
-    /// disabled.
+    /// Optional. This is used to save power, this is called when the timer queue is empty.
     fn disable_timer() {}
 }
 
@@ -113,43 +220,44 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
 
     /// Call this in the interrupt handler of the hardware timer supporting the `Monotonic`
     ///
-    /// Safety: It's always safe to call, but it should only be called from the interrupt of the
-    /// monotonic timer.
+    /// Safety: It's always safe to call, but it must only be called from the interrupt of the
+    /// monotonic timer for correct operation.
     pub unsafe fn on_monotonic_interrupt(&self) {
-        let now = Mono::now();
-
         Mono::clear_compare_flag();
+        Mono::on_interrupt();
 
         loop {
-            let head = self.queue.peek(|head_value| {
-                head_value
-                    .map(|val| Some((now >= val.release_at, val.release_at)))
-                    .unwrap_or(None)
+            let now = Mono::now();
+
+            let mut release_at = None;
+            let head = self.queue.pop_if(|head| {
+                release_at = Some(head.release_at);
+
+                now >= head.release_at
             });
 
-            if let Some((should_pop, release_at)) = head {
-                match (should_pop, release_at) {
-                    (false, instant) => {
-                        Mono::enable_timer();
-                        Mono::set_compare(instant);
+            match (head, release_at) {
+                (Some(link), _) => {
+                    link.waker.wake();
+                }
+                (None, Some(instant)) => {
+                    Mono::enable_timer();
+                    Mono::set_compare(instant);
 
+                    if Mono::now() >= instant {
                         // The time for the next instant passed while handling it,
                         // continue dequeueing
-                        if Mono::now() >= instant {
-                            continue;
-                        }
+                        continue;
+                    }
 
-                        break;
-                    }
-                    (true, _) => {
-                        if let Some(waker) = self.queue.pop() {
-                            waker.waker.wake();
-                        }
-                    }
+                    break;
                 }
-            } else {
-                // Queue is empty
-                Mono::disable_timer();
+                (None, None) => {
+                    // Queue is empty
+                    Mono::disable_timer();
+
+                    break;
+                }
             }
         }
     }
@@ -209,7 +317,13 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
 
             if first_run {
                 first_run = false;
-                marker.store(queue.insert(&mut link), Ordering::Relaxed);
+                let (was_empty, addr) = queue.insert(&mut link);
+                marker.store(addr, Ordering::Relaxed);
+
+                if was_empty {
+                    // Pend the monotonic handler if the queue was empty to setup the timer.
+                    Mono::pend_interrupt();
+                }
             }
 
             Poll::Pending
@@ -276,8 +390,8 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
     }
 
     #[inline(never)]
-    /// Pop the first element in the queue.
-    pub fn pop(&self) -> Option<T> {
+    /// Pop the first element in the queue if the closure returns true.
+    pub fn pop_if<F: FnOnce(&T) -> bool>(&self, f: F) -> Option<T> {
         cs::with(|_| {
             // Make sure all previous writes are visible
             core::sync::atomic::fence(Ordering::SeqCst);
@@ -286,17 +400,18 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
 
             // SAFETY: `as_ref` is safe as `insert` requires a valid reference to a link
             if let Some(head) = unsafe { head.as_ref() } {
-                // Move head to the next element
-                self.head
-                    .store(head.next.load(Ordering::Relaxed), Ordering::Relaxed);
+                if f(&head.val) {
+                    // Move head to the next element
+                    self.head
+                        .store(head.next.load(Ordering::Relaxed), Ordering::Relaxed);
 
-                // We read the value at head
-                let head_val = head.val.clone();
+                    // We read the value at head
+                    let head_val = head.val.clone();
 
-                Some(head_val)
-            } else {
-                None
+                    return Some(head_val);
+                }
             }
+            None
         })
     }
 
@@ -349,8 +464,8 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
 
     #[inline(never)]
     /// Insert a new link into the linked list.
-    /// The address of the link is return for use with `delete`.
-    pub fn insert(&self, val: &mut Link<T>) -> usize {
+    /// The return is (was_empty, address), where the address of the link is for use with `delete`.
+    pub fn insert(&self, val: &mut Link<T>) -> (bool, usize) {
         cs::with(|_| {
             let addr = val as *const _ as usize;
 
@@ -367,7 +482,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
                 head_ref
             } else {
                 self.head.store(val, Ordering::Relaxed);
-                return addr;
+                return (true, addr);
             };
 
             // 2. val needs to go in first
@@ -378,7 +493,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
                 // `val` is now first in the queue
                 self.head.store(val, Ordering::Relaxed);
 
-                return addr;
+                return (false, addr);
             }
 
             // 3. search list for correct place
@@ -396,7 +511,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
                     // Insert `val`
                     curr.next.store(val, Ordering::Relaxed);
 
-                    return addr;
+                    return (false, addr);
                 }
 
                 // Continue searching
@@ -407,7 +522,7 @@ impl<T: PartialOrd + Clone> LinkedList<T> {
             // No next, write link to last position in list
             curr.next.store(val, Ordering::Relaxed);
 
-            addr
+            (false, addr)
         })
     }
 }
@@ -449,5 +564,5 @@ fn RADIO() {
     let mut link = Link::new(8);
     LL.insert(&mut link);
 
-    LL.pop();
+    LL.pop_if(|_| true);
 }
