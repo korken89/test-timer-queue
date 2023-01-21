@@ -3,9 +3,9 @@
 #![no_std]
 #![no_main]
 #![deny(missing_docs)]
+#![allow(incomplete_features)]
 #![feature(async_fn_in_trait)]
 
-use core::cell::UnsafeCell;
 use core::future::{poll_fn, Future};
 use core::marker::PhantomPinned;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
@@ -29,17 +29,17 @@ use embedded_hal_async::delay::DelayUs;
 
 /// Systick implementing `rtic_monotonic::Monotonic` which runs at a
 /// settable rate using the `TIMER_HZ` parameter.
-pub struct Systick<const TIMER_HZ: u32> {}
+pub struct Systick<const TIMER_HZ: u32>;
 
 impl<const TIMER_HZ: u32> Systick<TIMER_HZ> {
-    /// Provide a new `Monotonic` based on SysTick.
+    /// Start a `Monotonic` based on SysTick.
     ///
     /// The `sysclk` parameter is the speed at which SysTick runs at. This value should come from
     /// the clock generation function of the used HAL.
     ///
     /// Notice that the actual rate of the timer is a best approximation based on the given
     /// `sysclk` and `TIMER_HZ`.
-    pub fn new(mut systick: cortex_m::peripheral::SYST, sysclk: u32) -> Self {
+    pub fn start(mut systick: cortex_m::peripheral::SYST, sysclk: u32) {
         // + TIMER_HZ / 2 provides round to nearest instead of round to 0.
         // - 1 as the counter range is inclusive [0, reload]
         let reload = (sysclk + TIMER_HZ / 2) / TIMER_HZ - 1;
@@ -52,8 +52,6 @@ impl<const TIMER_HZ: u32> Systick<TIMER_HZ> {
         systick.set_reload(reload);
         systick.enable_interrupt();
         systick.enable_counter();
-
-        Systick {}
     }
 
     fn systick() -> SYST {
@@ -70,6 +68,10 @@ impl<const TIMER_HZ: u32> Monotonic for Systick<TIMER_HZ> {
     const ZERO: Self::Instant = Self::Instant::from_ticks(0);
 
     fn now() -> Self::Instant {
+        if Self::systick().has_wrapped() {
+            SYSTICK_CNT.fetch_add(1, Ordering::AcqRel);
+        }
+
         Self::Instant::from_ticks(SYSTICK_CNT.load(Ordering::Relaxed))
     }
 
@@ -119,6 +121,8 @@ macro_rules! make_systick_timer_queue {
         unsafe extern "C" fn SysTick() {
             $timer_queue_name.on_monotonic_interrupt();
         }
+
+        // TODO: Generate a helper so the correct systick is used?
     };
 }
 
@@ -207,7 +211,7 @@ pub struct TimerQueue<Mono: Monotonic> {
     queue: LinkedList<WaitingWaker<Mono>>,
 }
 
-/// .
+/// This indicates that there was a timeout.
 pub struct TimeoutError;
 
 impl<Mono: Monotonic> TimerQueue<Mono> {
@@ -227,13 +231,11 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
         Mono::on_interrupt();
 
         loop {
-            let now = Mono::now();
-
             let mut release_at = None;
             let head = self.queue.pop_if(|head| {
                 release_at = Some(head.release_at);
 
-                now >= head.release_at
+                Mono::now() >= head.release_at
             });
 
             match (head, release_at) {
@@ -545,24 +547,11 @@ impl<T> Link<T> {
     }
 }
 
-static LL: LinkedList<u32> = LinkedList::new();
-
 #[entry]
 fn main() -> ! {
-    cs::with(|_| {
-        cortex_m::asm::nop();
-        cortex_m::asm::nop();
-        cortex_m::asm::nop();
-    });
-
     loop {}
 }
 
 #[allow(non_snake_case)]
 #[interrupt]
-fn RADIO() {
-    let mut link = Link::new(8);
-    LL.insert(&mut link);
-
-    LL.pop_if(|_| true);
-}
+fn RADIO() {}
