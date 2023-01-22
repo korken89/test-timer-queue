@@ -18,6 +18,8 @@ use nrf52832_hal as _;
 use panic_probe as _;
 use systick_monotonic::{Systick, TimerQueue};
 
+use crate::rtic_monotonic::Monotonic;
+
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked
 #[defmt::panic_handler]
@@ -31,6 +33,13 @@ pub fn exit() -> ! {
         cortex_m::asm::bkpt();
     }
 }
+
+defmt::timestamp!("{=u64:us}", {
+    let time_us: fugit::MicrosDurationU32 =
+        Systick::<1_000>::now().duration_since_epoch().convert();
+
+    time_us.ticks() as u64
+});
 
 make_systick_timer_queue!(MONO, Systick<1_000>);
 
@@ -53,9 +62,14 @@ mod app {
         defmt::println!("init");
 
         let systick = Systick::start(cx.core.SYST, 64_000_000);
+
+        defmt::println!("initializing monotonic");
+
         MONO.initialize(systick);
 
         async_task::spawn().ok();
+        async_task2::spawn().ok();
+        async_task3::spawn().ok();
 
         (Shared {}, Local {})
     }
@@ -72,8 +86,24 @@ mod app {
     #[task]
     async fn async_task(_: async_task::Context) {
         loop {
-            defmt::println!("async task");
+            defmt::println!("async task waiting for 1 second");
             MONO.delay(1.secs()).await;
+        }
+    }
+
+    #[task]
+    async fn async_task2(_: async_task2::Context) {
+        loop {
+            defmt::println!("    async task 2 waiting for 0.5 second");
+            MONO.delay(500.millis()).await;
+        }
+    }
+
+    #[task]
+    async fn async_task3(_: async_task3::Context) {
+        loop {
+            defmt::println!("        async task 3 waiting for 0.2 second");
+            MONO.delay(200.millis()).await;
         }
     }
 }

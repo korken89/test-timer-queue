@@ -12,7 +12,7 @@ nrf52832-hal = "*"
 rtic-monotonic = "1"
 futures-util = { version = "0.3.25", default-features = false }
 embedded-hal-async = "0.2.0-alpha.0"
-fugit = "0.3.6"
+fugit = { version = "0.3.6", features = ["defmt"] }
 
 rtic = { git = "https://github.com/rtic-rs/new-structure-test.git", branch = "min-codegen" }
 
