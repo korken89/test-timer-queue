@@ -5,21 +5,18 @@
 #![deny(missing_docs)]
 #![allow(incomplete_features)]
 #![feature(async_fn_in_trait)]
+#![feature(type_alias_impl_trait)]
 
 use core::future::{poll_fn, Future};
 use core::marker::PhantomPinned;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 use cortex_m::peripheral::SYST;
-use cortex_m_rt::entry;
 use fugit::ExtU32;
 use futures_util::{
     future::{select, Either},
     pin_mut,
 };
-use nrf52832_hal as _;
-use nrf52832_hal::pac::interrupt;
-use panic_halt as _;
 
 use critical_section as cs;
 
@@ -39,7 +36,7 @@ impl<const TIMER_HZ: u32> Systick<TIMER_HZ> {
     ///
     /// Notice that the actual rate of the timer is a best approximation based on the given
     /// `sysclk` and `TIMER_HZ`.
-    pub fn start(mut systick: cortex_m::peripheral::SYST, sysclk: u32) {
+    pub fn start(mut systick: cortex_m::peripheral::SYST, sysclk: u32) -> Self {
         // + TIMER_HZ / 2 provides round to nearest instead of round to 0.
         // - 1 as the counter range is inclusive [0, reload]
         let reload = (sysclk + TIMER_HZ / 2) / TIMER_HZ - 1;
@@ -52,6 +49,8 @@ impl<const TIMER_HZ: u32> Systick<TIMER_HZ> {
         systick.set_reload(reload);
         systick.enable_interrupt();
         systick.enable_counter();
+
+        Systick {}
     }
 
     fn systick() -> SYST {
@@ -113,7 +112,7 @@ impl<const TIMER_HZ: u32> DelayUs for TimerQueue<Systick<TIMER_HZ>> {
 /// Register the Systick interrupt and crate a timer queue with a specific name.
 #[macro_export]
 macro_rules! make_systick_timer_queue {
-    ($timer_queue_name:ident, $systick:ident) => {
+    ($timer_queue_name:ident, $systick:path) => {
         static $timer_queue_name: TimerQueue<$systick> = TimerQueue::new();
 
         #[no_mangle]
@@ -209,6 +208,7 @@ impl<Mono: Monotonic> PartialOrd for WaitingWaker<Mono> {
 /// A generic timer queue for async executors.
 pub struct TimerQueue<Mono: Monotonic> {
     queue: LinkedList<WaitingWaker<Mono>>,
+    initialized: AtomicBool,
 }
 
 /// This indicates that there was a timeout.
@@ -219,7 +219,17 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
     pub const fn new() -> Self {
         Self {
             queue: LinkedList::new(),
+            initialized: AtomicBool::new(false),
         }
+    }
+
+    // TODO: Is this needed as type enforcement?
+    /// Takes the initialized monotonic to initialize the TimerQueue.
+    pub fn initialize(&self, monotonic: Mono) {
+        self.initialized.store(true, Ordering::SeqCst);
+
+        // Don't run drop on `Mono`
+        core::mem::forget(monotonic);
     }
 
     /// Call this in the interrupt handler of the hardware timer supporting the `Monotonic`
@@ -229,6 +239,12 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
     pub unsafe fn on_monotonic_interrupt(&self) {
         Mono::clear_compare_flag();
         Mono::on_interrupt();
+
+        if !self.initialized.load(Ordering::Relaxed) {
+            panic!(
+                "The timer queue is not initialized with a monotonic, you need to run `initialize`"
+            );
+        }
 
         loop {
             let mut release_at = None;
@@ -547,11 +563,66 @@ impl<T> Link<T> {
     }
 }
 
-#[entry]
-fn main() -> ! {
-    loop {}
+// -------- Test program ---------
+
+use defmt_rtt as _;
+use nrf52832_hal as _;
+use panic_probe as _;
+
+// same panicking *behavior* as `panic-probe` but doesn't print a panic message
+// this prevents the panic message being printed *twice* when `defmt::panic` is invoked
+#[defmt::panic_handler]
+fn panic() -> ! {
+    cortex_m::asm::udf()
 }
 
-#[allow(non_snake_case)]
-#[interrupt]
-fn RADIO() {}
+/// Terminates the application and makes `probe-run` exit with exit-code = 0
+pub fn exit() -> ! {
+    loop {
+        cortex_m::asm::bkpt();
+    }
+}
+
+make_systick_timer_queue!(MONO, Systick<1_000>);
+
+#[rtic::app(
+    device = nrf52832_hal::pac,
+    dispatchers = [SWI0_EGU0, SWI1_EGU1, SWI2_EGU2, SWI3_EGU3, SWI4_EGU4, SWI5_EGU5],
+)]
+mod app {
+    use super::{Systick, MONO};
+    use fugit::ExtU32;
+
+    #[shared]
+    struct Shared {}
+
+    #[local]
+    struct Local {}
+
+    #[init]
+    fn init(cx: init::Context) -> (Shared, Local) {
+        async_task::spawn().ok();
+
+        let systick = Systick::start(cx.core.SYST, 64_000_000);
+        MONO.initialize(systick);
+
+        defmt::println!("init");
+
+        (Shared {}, Local {})
+    }
+
+    #[idle]
+    fn idle(_: idle::Context) -> ! {
+        defmt::println!("idle");
+
+        loop {}
+    }
+
+    #[task]
+    async fn async_task(_: async_task::Context) {
+        loop {
+            defmt::println!("async task");
+            MONO.delay(1.secs()).await;
+        }
+    }
+}
