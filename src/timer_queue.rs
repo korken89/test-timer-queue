@@ -83,7 +83,9 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
 
     /// Call this in the interrupt handler of the hardware timer supporting the `Monotonic`
     ///
-    /// Safety: It's always safe to call, but it must only be called from the interrupt of the
+    /// # Safety
+    ///
+    /// It's always safe to call, but it must only be called from the interrupt of the
     /// monotonic timer for correct operation.
     pub unsafe fn on_monotonic_interrupt(&self) {
         Mono::clear_compare_flag();

@@ -50,12 +50,12 @@ mod app {
 
     #[init]
     fn init(cx: init::Context) -> (Shared, Local) {
-        async_task::spawn().ok();
+        defmt::println!("init");
 
         let systick = Systick::start(cx.core.SYST, 64_000_000);
         MONO.initialize(systick);
 
-        defmt::println!("init");
+        async_task::spawn().ok();
 
         (Shared {}, Local {})
     }
@@ -64,7 +64,9 @@ mod app {
     fn idle(_: idle::Context) -> ! {
         defmt::println!("idle");
 
-        loop {}
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     #[task]

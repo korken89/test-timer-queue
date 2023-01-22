@@ -87,11 +87,13 @@ impl<const TIMER_HZ: u32> DelayUs for TimerQueue<Systick<TIMER_HZ>> {
     type Error = core::convert::Infallible;
 
     async fn delay_us(&mut self, us: u32) -> Result<(), Self::Error> {
-        Ok(self.delay(us.micros()).await)
+        self.delay(us.micros()).await;
+        Ok(())
     }
 
     async fn delay_ms(&mut self, ms: u32) -> Result<(), Self::Error> {
-        Ok(self.delay(ms.millis()).await)
+        self.delay(ms.millis()).await;
+        Ok(())
     }
 }
 
