@@ -36,6 +36,9 @@ impl<const TIMER_HZ: u32> Systick<TIMER_HZ> {
     ///
     /// Notice that the actual rate of the timer is a best approximation based on the given
     /// `sysclk` and `TIMER_HZ`.
+    ///
+    /// Note: Give the return value to `TimerQueue::initialize()` to initialize the timer queue.
+    #[must_use]
     pub fn start(mut systick: cortex_m::peripheral::SYST, sysclk: u32) -> Self {
         // + TIMER_HZ / 2 provides round to nearest instead of round to 0.
         // - 1 as the counter range is inclusive [0, reload]
@@ -120,8 +123,6 @@ macro_rules! make_systick_timer_queue {
         unsafe extern "C" fn SysTick() {
             $timer_queue_name.on_monotonic_interrupt();
         }
-
-        // TODO: Generate a helper so the correct systick is used?
     };
 }
 
@@ -206,6 +207,20 @@ impl<Mono: Monotonic> PartialOrd for WaitingWaker<Mono> {
 }
 
 /// A generic timer queue for async executors.
+///
+/// # Blocking
+///
+/// The internal priority queue uses global critical sections to manage access. This means that
+/// `await`ing a delay will cause a lock of the entire system for O(n) time. In practice the lock
+/// duration is ~10 clock cycles per element in the queue.
+///
+/// # Safety
+///
+/// This timer queue is based on an intrusive linked list, and by extension the links are strored
+/// on the async stacks of callers. The links are deallocated on `drop` or when the wait is
+/// complete.
+///
+/// Do not call `mem::forget` on an awaited future, or there will be dragons!
 pub struct TimerQueue<Mono: Monotonic> {
     queue: LinkedList<WaitingWaker<Mono>>,
     initialized: AtomicBool,
@@ -298,6 +313,7 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
     }
 
     /// Timeout after a specific duration.
+    #[inline]
     pub async fn timeout_after<F: Future>(
         &self,
         duration: Mono::Duration,
@@ -307,6 +323,7 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
     }
 
     /// Delay for some duration of time.
+    #[inline]
     pub async fn delay(&self, duration: Mono::Duration) {
         let now = Mono::now();
 
