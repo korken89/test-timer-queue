@@ -16,9 +16,8 @@ pub mod timer_queue;
 use defmt_rtt as _;
 use nrf52832_hal as _;
 use panic_probe as _;
-use systick_monotonic::{Systick, TimerQueue};
 
-use crate::rtic_monotonic::Monotonic;
+use systick_monotonic::{Systick, TimerQueue};
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked
@@ -35,8 +34,7 @@ pub fn exit() -> ! {
 }
 
 defmt::timestamp!("{=u64:us}", {
-    let time_us: fugit::MicrosDurationU32 =
-        Systick::<1_000>::now().duration_since_epoch().convert();
+    let time_us: fugit::MicrosDurationU32 = MONO.now().duration_since_epoch().convert();
 
     time_us.ticks() as u64
 });

@@ -72,6 +72,12 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
         }
     }
 
+    /// Forwards the `Monotonic::now()` method.
+    #[inline(always)]
+    pub fn now(&self) -> Mono::Instant {
+        Mono::now()
+    }
+
     // TODO: Is this needed as type enforcement?
     /// Takes the initialized monotonic to initialize the TimerQueue.
     pub fn initialize(&self, monotonic: Mono) {
