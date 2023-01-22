@@ -43,8 +43,18 @@ pub trait Monotonic {
     fn on_interrupt() {}
 
     /// Optional. This is used to save power, this is called when the timer queue is not empty.
+    ///
+    /// Enabling and disabling the monotonic needs to propagate to `now` so that an instant
+    /// based of `now()` is still valid.
+    ///
+    /// NOTE: This may be called more than once.
     fn enable_timer() {}
 
     /// Optional. This is used to save power, this is called when the timer queue is empty.
+    ///
+    /// Enabling and disabling the monotonic needs to propagate to `now` so that an instant
+    /// based of `now()` is still valid.
+    ///
+    /// NOTE: This may be called more than once.
     fn disable_timer() {}
 }
