@@ -91,12 +91,6 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
         Mono::clear_compare_flag();
         Mono::on_interrupt();
 
-        if !self.initialized.load(Ordering::Relaxed) {
-            panic!(
-                "The timer queue is not initialized with a monotonic, you need to run `initialize`"
-            );
-        }
-
         loop {
             let mut release_at = None;
             let head = self.queue.pop_if(|head| {
@@ -168,6 +162,12 @@ impl<Mono: Monotonic> TimerQueue<Mono> {
 
     /// Delay to some specific time instant.
     pub async fn delay_until(&self, instant: Mono::Instant) {
+        if !self.initialized.load(Ordering::Relaxed) {
+            panic!(
+                "The timer queue is not initialized with a monotonic, you need to run `initialize`"
+            );
+        }
+
         let mut first_run = true;
         let queue = &self.queue;
         let mut link = Link::new(WaitingWaker {
